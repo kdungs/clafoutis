@@ -1,0 +1,179 @@
+#!/bin/bash
+
+# This is the entry point for Clafoutis. It will download the latest RaspiOS
+# lite image and set everything up to run your installer script inside a
+# chroot.
+
+# TODO(kdungs): Replace the hard coded offsets by calculated values.
+# TODO(kdungs): Allow user to provide custom base image.
+# TODO(kdungs): Allow user to provide growth constant themselves.
+
+BASEIMG_URL="https://downloads.raspberrypi.org/raspios_lite_armhf_latest"
+BASEIMG_SHA="4522df4a29f9aac4b0166fbfee9f599dab55a997c855702bfe35329c13334668"
+BASEIMG_NAME="2020-08-20-raspios-buster-armhf-lite.img"
+BASEIMG_OFFSET_BOOT=4194304
+BASEIMG_OFFSET_ROOT=272629760
+
+
+set -e -u -o pipefail
+
+distdir="/dist"
+imgname="myimage"
+outdir=""
+zipimage=false
+
+function usage {
+    cat <<EOF
+usage clafoutis [options]
+  options:
+     -d
+     --distdir        Directory from which to install the distribution
+                      Default '${distdir}'
+     -n
+     --name           Name of the resulting image
+                      Will be extended with .img
+                        or .zip if the -z option is selected
+                      Default '${imgname}'
+     -o
+     --outdir         Directory for the resulting image or zip file.
+                      Use this when running locally and provide it with a
+                        writable Docker volume
+                      If not specified, the result will be located at /
+                      Default: '${outdir}'
+     -z
+     --zip            Zip the resulting image file
+                      Default: ${zipimage}
+     -h
+     --help           Show this message and exit
+EOF
+    exit "${1}"
+}
+
+function log {
+  echo "🍒 [$(date --iso-8601="seconds")] ${1}"
+}
+
+function error {
+  echo "⚠️  ${1}" >&2
+}
+
+
+# Transform long options to short ones
+for arg in "$@"; do
+  shift
+  case "$arg" in
+    "--distdir") set -- "$@" "-d" ;;
+    "--help") set -- "$@" "-h" ;;
+    "--name") set -- "$@" "-n" ;;
+    "--outdir") set -- "$@" "-o" ;;
+    "--zip") set -- "$@" "-z" ;;
+    *) set -- "$@" "$arg"
+  esac
+done
+OPTIND=1
+while getopts "d:n:o:hz" opt
+do
+  case "$opt" in
+    "d") distdir="${OPTARG}" ;;
+    "n") imgname="${OPTARG}" ;;
+    "o") outdir="${OPTARG}" ;;
+    "h") usage 0 ;;
+    "z") zipimage=true ;;
+    *) error "invalid argument '${arg}'"; usage 1 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+
+if [ "$(id -u)" != 0 ]; then
+   error "must be run as root"
+   exit 1
+fi
+
+if ! losetup --find > /dev/null; then
+  error "loopback devices must be available"
+  error "maybe you're not running Docker privileged?"
+  exit 1
+fi
+
+
+cat <<EOF
+
+    🍒 Clafoutis 🥧
+         ${CLAFOUTIS_VERSION}
+
+EOF
+
+
+# Mounting a loopback device from an image on a Docker volume doesn't seem to
+# work. So we have to place the image inside the container's file system in
+# order to modify it.
+img="/${imgname}.img"
+log "Downloading base image."
+pushd "$(mktemp -d)" > /dev/null
+curl -L -o "raspios.zip" "${BASEIMG_URL}"
+echo "${BASEIMG_SHA} *raspios.zip" | sha256sum --check
+unzip "raspios.zip"
+mv "${BASEIMG_NAME}" "${img}"
+popd > /dev/null
+
+
+log "Growing the image and mounting the file systems"
+dd if=/dev/zero bs=1M count=1024 >> "${img}"
+sync
+lo=$(losetup --partscan --find --show "${img}")
+parted "${lo}" resizepart 2 100%
+losetup --detach "${lo}"
+# Mount /
+loroot=$(losetup --offset="${BASEIMG_OFFSET_ROOT}" --find --show "${img}")
+e2fsck -f -p "${loroot}"
+resize2fs "${loroot}"
+mount -t ext4 "${loroot}" /mnt/
+# Mount /boot/
+loboot=$(losetup --offset="${BASEIMG_OFFSET_BOOT}" --find --show "${img}")
+mount -t vfat "${loboot}" /mnt/boot/
+
+
+log "Mounting the ${distdir} directory for the chroot"
+mkdir /mnt/dist/
+mount --bind "${distdir}" /mnt/dist/
+
+
+log "Running install.sh inside chroot"
+chroot /mnt /dist/install.sh
+
+
+log "Unmounting file system"
+umount /mnt/dist/
+rmdir /mnt/dist/
+umount /mnt/boot
+umount /mnt
+zerofree "${loroot}"
+losetup --detach "${loboot}"
+losetup --detach "${loroot}"
+
+
+result="${img}"
+
+if [ "${zipimage}" = true ]; then
+  log "Zipping image"
+  result="${img%.img}.zip"
+  zip "${result}" "${img}"
+fi
+
+if [ "${outdir}" != "" ]; then
+  log "Moving ${result} to ${outdir}"
+  mv "${result}" "${outdir}${result}"
+  result="${outdir}${result}"
+fi
+
+
+sync
+
+
+log "Done building ${result}"
+cat <<EOF
+
+    🍒 Enjoy your freshly baked image! 🥧
+
+EOF
