@@ -92,6 +92,7 @@ docker run \
   --volume=/absolute/path/to/dist:/dist:ro \
   --volume=/absolute/path/to/image:/image \
   kdungs/clafoutis:latest \
+  clafoutis \
   --distdir /dist \
   --outdir /image \
   --name myimage
